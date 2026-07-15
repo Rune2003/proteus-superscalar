@@ -2,7 +2,10 @@ package riscv.plugins.scheduling.dynamic
 
 import riscv._
 import spinal.core._
-import spinal.lib.{Counter, Flow}
+import spinal.lib._
+
+import scala.collection.mutable.ArrayBuffer
+import scala.language.postfixOps
 
 case class RobEntry(retirementRegisters: DynBundle[PipelineData[Data]])(implicit config: Config)
     extends Bundle {
@@ -82,8 +85,6 @@ class ReorderBuffer(
   currentSoftResetTrigger.setIdle()
   val currentCdbUpdate = Flow(UInt(indexBits))
   currentCdbUpdate.setIdle()
-  val currentCdbSoftReset = Bool()
-  currentCdbSoftReset := False
   val currentRdbUpdate = Flow(UInt(indexBits))
   currentRdbUpdate.setIdle()
 
@@ -129,6 +130,7 @@ class ReorderBuffer(
 
   val psfMispredictions = RegInit(UInt(config.xlen bits).getZero)
   val psfPredictions = RegInit(UInt(config.xlen bits).getZero)
+  val totalLoads = RegInit(UInt(config.xlen bits).getZero)
 
   val previousStoreBuffer = RegInit(UInt(config.xlen bits).getZero)
   val previousStoreAddress =
@@ -167,47 +169,151 @@ class ReorderBuffer(
     }
   }
 
-  private def softFlush(lastCorrectId: UInt, nextPc: UInt): Bool = {
-    val ret = False
-    // prevent flushes caused by transient instructions
-    when(!robEntries(lastCorrectId).invalidated && !hardResetThisCycle && !softResetTrigger.valid) {
-      // this is fine, because fences are always the last instruction in the ROB (cannot insert anything else while it's present)
-      fenceDetected := False
+  /*
+   * Flush mechanism arbitration classes and structures
+   */
 
-      softResetThisCycle := True
-      softResetTrigger.push(lastCorrectId)
-      currentSoftResetTrigger.push(lastCorrectId)
-      newestAtSoftReset := newestIndex
 
-      // set fetch PC to correct next PC (even if it was predicted as something else) and invalidate issuepipeline stages
-      pipeline.issuePipeline.service[JumpService].jump(nextPc)
+  class FlushActionBuilder(req: FlushPort) {
+    def onSoftFlush(block: => Unit): FlushActionBuilder = {
+      when(req.grantedSoftFlush) { block }
+      this
+    }
 
-      // reset last speculative instruction
-      lastSpeculativeCFInstruction.setIdle()
+    def onHardFlush(block: => Unit): FlushActionBuilder = {
+      when(req.grantedHardFlush) { block }
+      this
+    }
 
-      // ensure entries between oldest and newest are invalidated -> new entry should only be pushed
-      //     if rob/cdb updates are already there for invalid or stages got invalidated
-      for (relative <- 0 until capacity) {
-        val absolute = absoluteIndexForRelative(relative).resized
-        val entry = robEntries(absolute)
-        when(isValidAbsoluteIndex(absolute)) {
-          when(relative > relativeIndexForAbsolute(lastCorrectId)) {
-            entry.invalidated := True
-          } otherwise {
-            // if there are still valid control-flow speculation instructions, set the youngest one as the last
-            pipeline.serviceOption[SpeculationService] foreach { spec =>
-              when(spec.isSpeculativeCF(entry.registerMap)) {
-                lastSpeculativeCFInstruction.push(absolute)
+    def onAnyFlush(block: => Unit): FlushActionBuilder = {
+      when(req.grantedAnyFlush) { block }
+      this
+    }
+  }
+
+  class FlushPort(implicit config: Config) extends Bundle {
+    flushRequests += this
+
+    val valid            = Bool()
+    val lastCorrectId    = UInt(indexBits)
+    val nextPc           = UInt(config.xlen bits)
+
+    val grantedSoftFlush = Bool()
+    val grantedHardFlush = Bool()
+    def grantedAnyFlush  = grantedSoftFlush || grantedHardFlush
+
+    def init(lastCorrectId: UInt, nextPc: UInt): FlushPort = {
+      this.lastCorrectId := lastCorrectId
+      this.nextPc := nextPc
+      this.valid := False
+      this.grantedSoftFlush := False
+      this.grantedHardFlush := False
+      this
+    }
+
+    def request(): FlushActionBuilder = {
+      this.valid := True
+      new FlushActionBuilder(this)
+    }
+
+    def requestPsf(pc: UInt): Unit = {
+      request().onAnyFlush {
+        addPsfPredictorEntry(pc)
+        psfMispredictions := psfMispredictions + 1
+      }
+    }
+
+    def requestSsb(pc: UInt): Unit = {
+      request().onAnyFlush {
+        addSsbPredictorEntry(pc)
+        ssbMispredictions := ssbMispredictions + 1
+      }
+    }
+  }
+
+  private val flushRequests = ArrayBuffer[FlushPort]()
+
+
+  def processFlushes(): Unit = {
+    var winnerFound: Bool = False
+    var winningIndex: UInt = U(0, indexBits)
+    var winningPc: UInt = U(0, config.xlen bits)
+
+    for (req <- flushRequests) {
+      val older = isOlder(req.lastCorrectId, winningIndex)
+      val takeThis = req.valid && (!winnerFound || older)
+
+      winnerFound = winnerFound || req.valid
+      winningIndex = Mux(takeThis, req.lastCorrectId, winningIndex)
+      winningPc = Mux(takeThis, req.nextPc, winningPc)
+    }
+
+    when(winnerFound) {
+      val winningEntry = robEntries(winningIndex)
+
+      when(!winningEntry.invalidated && !hardResetThisCycle) {
+        val winnerMask = B(flushRequests.map(req => req.valid && req.lastCorrectId === winningIndex))
+        val singleWinnerOH = OHMasking.firstV2(winnerMask)
+
+        // 1. Isolate the retirement check adapted for single-retire ROB
+        val currentTriggerRetiring = softResetTrigger.valid &&
+          softResetTrigger.payload === oldestIndex.value &&
+          willRetire
+
+        // 2. Define `currentTriggerValid` as an ACTIVE trigger, not just a retiring one
+        val currentTriggerValid = softResetTrigger.valid && !currentTriggerRetiring
+
+        // 3. Routing booleans utilizing the corrected active state
+        val isRedundant = currentTriggerValid && winningIndex === softResetTrigger.payload
+        val canSoftFlush = !currentTriggerValid || isOlder(winningIndex, softResetTrigger.payload)
+
+        when(isRedundant) {
+          // Do nothing
+        } elsewhen(canSoftFlush) {
+          // --- SOFT FLUSH ---
+          fenceDetected := False
+          softResetThisCycle := True
+          softResetTrigger.push(winningIndex)
+          currentSoftResetTrigger.push(winningIndex)
+          newestAtSoftReset := newestIndex.value
+
+          pipeline.issuePipeline.service[JumpService].jump(winningPc)
+          lastSpeculativeCFInstruction.setIdle()
+
+          for ((req, i) <- flushRequests.zipWithIndex) {
+            when(singleWinnerOH(i)) {
+              req.grantedSoftFlush := True
+            }
+          }
+
+          for (relative <- 0 until capacity) {
+            val absolute = absoluteIndexForRelative(relative).resized
+            val entry = robEntries(absolute)
+            when(isValidAbsoluteIndex(absolute)) {
+              when(relative > relativeIndexForAbsolute(winningIndex)) {
+                entry.invalidated := True
+              } otherwise {
+                pipeline.serviceOption[SpeculationService] foreach { spec =>
+                  when(spec.isSpeculativeCF(entry.registerMap)) {
+                    lastSpeculativeCFInstruction.push(absolute)
+                  }
+                }
               }
+            }
+          }
+          softFlushCounter := softFlushCounter + 1
+        } otherwise {
+          // --- HARD FLUSH FALLBACK ---
+          pipeline.service[JumpService].jumpOfBundle(winningEntry.registerMap) := True
+
+          for ((req, i) <- flushRequests.zipWithIndex) {
+            when(singleWinnerOH(i)) {
+              req.grantedHardFlush := True
             }
           }
         }
       }
-      softFlushCounter := softFlushCounter + 1
-
-      ret := True
     }
-    ret
   }
 
   private def byte2WordAddress(address: UInt) = {
@@ -384,24 +490,14 @@ class ReorderBuffer(
           cdbMessage.robIndex
         ).rdbUpdated || (currentRdbUpdate.valid && currentRdbUpdate.payload === cdbMessage.robIndex)
         currentCdbUpdate.push(cdbMessage.robIndex)
-        // do not update stored value when it's a misprediction update
-        psfMispredictions := psfMispredictions + 1
-        addPsfPredictorEntry(
-          robEntries(cdbMessage.robIndex).registerMap
-            .elementAs[UInt](pipeline.data.PC.asInstanceOf[PipelineData[Data]])
-        )
-        val flushed = softFlush(
-          cdbMessage.robIndex,
-          robEntries(cdbMessage.robIndex).registerMap.elementAs[UInt](
-            pipeline.data.NEXT_PC.asInstanceOf[PipelineData[Data]]
-          )
-        )
-        currentCdbSoftReset := flushed
-        when(!flushed) {
-          pipeline
-            .service[JumpService]
-            .jumpOfBundle(robEntries(cdbMessage.robIndex).registerMap) := True
-        }
+
+        val pc = robEntries(cdbMessage.robIndex).registerMap
+          .elementAs[UInt](pipeline.data.PC.asInstanceOf[PipelineData[Data]])
+        val nextPc = robEntries(cdbMessage.robIndex).registerMap
+          .elementAs[UInt](pipeline.data.NEXT_PC.asInstanceOf[PipelineData[Data]])
+        val flushPort = (new FlushPort).init(cdbMessage.robIndex, nextPc)
+
+        flushPort.requestPsf(pc)
       } otherwise {
         robEntries(cdbMessage.robIndex).cdbUpdated := True
         robEntries(cdbMessage.robIndex).registerMap
@@ -504,18 +600,18 @@ class ReorderBuffer(
       val loadValue: UInt =
         entry.registerMap.elementAs[UInt](pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]])
       val valueValid = entry.cdbUpdated
-      val isYounger = relativeIndexForAbsolute(index) > relativeIndexForAbsolute(storeIndex)
+      val younger = isYounger(index, storeIndex)
 
       val speculative = pipeline.service[LsuService].stlSpeculation(entry.registerMap)
 
       val entriesMatch: Bool = if (config.addressBasedSsb) {
         isValidAbsoluteIndex(
           nth
-        ) && entryIsLoad && isYounger && (entryAddressValid && addressesMatch && speculative)
+        ) && entryIsLoad && younger && (entryAddressValid && addressesMatch && speculative)
       } else {
         isValidAbsoluteIndex(
           nth
-        ) && entryIsLoad && isYounger && (entryAddressValid && addressesMatch && speculative) && (!valueValid || storeValue =/= loadValue)
+        ) && entryIsLoad && younger && (entryAddressValid && addressesMatch && speculative) && (!valueValid || storeValue =/= loadValue)
       }
 
       when(entriesMatch) {
@@ -530,44 +626,25 @@ class ReorderBuffer(
     val jmp = pipeline.service[JumpService]
     val lsu = pipeline.service[LsuService]
 
+    val entry = robEntries(rdbMessage.robIndex)
+    val pc = entry.registerMap.elementAs[UInt](pipeline.data.PC.asInstanceOf[PipelineData[Data]])
+    val nextPc = rdbMessage.registerMap.elementAs[UInt](pipeline.data.NEXT_PC.asInstanceOf[PipelineData[Data]])
+
+    val flushPort = (new FlushPort).init(rdbMessage.robIndex, nextPc)
+
     currentRdbUpdate.push(rdbMessage.robIndex)
-    robEntries(rdbMessage.robIndex).registerMap := rdbMessage.registerMap
-    robEntries(rdbMessage.robIndex).willCdbUpdate := rdbMessage.willCdbUpdate
+    entry.registerMap := rdbMessage.registerMap
+    entry.willCdbUpdate := rdbMessage.willCdbUpdate
 
-    when(
-      rdbMessage.registerMap.elementAs[UInt](
-        pipeline.data.NEXT_PC.asInstanceOf[PipelineData[Data]]
-      ) =/= btb.predictedPc(rdbMessage.registerMap)
-    ) {
-      val flushed = False
-      when(!currentCdbSoftReset) {
-        flushed := softFlush(
-          rdbMessage.robIndex,
-          rdbMessage.registerMap.elementAs[UInt](
-            pipeline.data.NEXT_PC.asInstanceOf[PipelineData[Data]]
-          )
-        )
-      }
-
-      when(flushed) {
-        btb.preventFlush(robEntries(rdbMessage.robIndex).registerMap)
+    when(nextPc =/= btb.predictedPc(rdbMessage.registerMap)) {
+      flushPort.request().onSoftFlush {
+        btb.preventFlush(entry.registerMap)
       }
     }
 
     when(pipeline.service[CsrService].isCsrInstruction(rdbMessage.registerMap)) {
-      jmp.jumpOfBundle(robEntries(rdbMessage.robIndex).registerMap) := True
-      val flushed = False
-      when(!currentCdbSoftReset) {
-        flushed := softFlush(
-          rdbMessage.robIndex,
-          rdbMessage.registerMap.elementAs[UInt](
-            pipeline.data.NEXT_PC.asInstanceOf[PipelineData[Data]]
-          )
-        )
-      }
-
-      when(!flushed) {
-        // CSR reads are not correctly handled, so for now we always flush
+      flushPort.request().onSoftFlush {
+        jmp.jumpOfBundle(entry.registerMap) := True
       }
     }
 
@@ -591,47 +668,18 @@ class ReorderBuffer(
         val ssbReset = hasSpeculatingLoad(rdbMessage.robIndex, storeValue, storeAddress)
 
         when(ssbReset) {
-          addSsbPredictorEntry(
-            rdbMessage.registerMap.elementAs[UInt](
-              pipeline.data.PC.asInstanceOf[PipelineData[Data]]
-            )
-          )
-          ssbMispredictions := ssbMispredictions + 1
-          val flushed = False
-          when(!currentCdbSoftReset) {
-            flushed := softFlush(
-              rdbMessage.robIndex,
-              rdbMessage.registerMap.elementAs[UInt](
-                pipeline.data.NEXT_PC.asInstanceOf[PipelineData[Data]]
-              )
-            )
-          }
-          when(!flushed) {
-            jmp.jumpOfBundle(robEntries(rdbMessage.robIndex).registerMap) := True
-          }
+          flushPort.requestSsb(pc)
         }
       }
 
       if (config.addressBasedPsf) {
         when(lsu.psfMisspeculation(rdbMessage.registerMap)) {
-          psfMispredictions := psfMispredictions + 1
-          addPsfPredictorEntry(
-            robEntries(rdbMessage.robIndex).registerMap
-              .elementAs[UInt](pipeline.data.PC.asInstanceOf[PipelineData[Data]])
-          )
-          val flushed = softFlush(
-            rdbMessage.robIndex,
-            rdbMessage.registerMap.elementAs[UInt](
-              pipeline.data.NEXT_PC.asInstanceOf[PipelineData[Data]]
-            )
-          )
-          when(!flushed) {
-            jmp.jumpOfBundle(robEntries(rdbMessage.robIndex).registerMap) := True
-          }
+          flushPort.requestPsf(pc)
         }
         when(
           lsu.operationOfBundle(rdbMessage.registerMap) === LsuOperationType.LOAD
         ) {
+          totalLoads := totalLoads + 1
           when(
             (currentCdbUpdate.valid && currentCdbUpdate.payload === rdbMessage.robIndex) || jmp
               .jumpOfBundle(robEntries(rdbMessage.robIndex).registerMap)
@@ -662,23 +710,7 @@ class ReorderBuffer(
           }
 
           when(psfMismatch) {
-            psfMispredictions := psfMispredictions + 1
-            addPsfPredictorEntry(
-              robEntries(rdbMessage.robIndex).registerMap
-                .elementAs[UInt](pipeline.data.PC.asInstanceOf[PipelineData[Data]])
-            )
-            val flushed = False
-            when(!currentCdbSoftReset) {
-              flushed := softFlush(
-                rdbMessage.robIndex,
-                rdbMessage.registerMap.elementAs[UInt](
-                  pipeline.data.NEXT_PC.asInstanceOf[PipelineData[Data]]
-                )
-              )
-            }
-            when(!flushed) {
-              jmp.jumpOfBundle(robEntries(rdbMessage.robIndex).registerMap) := True
-            }
+            flushPort.requestPsf(pc)
           } otherwise {
             psfPredictions := psfPredictions + 1
           }
@@ -690,6 +722,8 @@ class ReorderBuffer(
   }
 
   def build(): Unit = {
+    processFlushes()
+
     isFullNext := isFull
     fenceDetectedNext := fenceDetected
     val oldestEntry = robEntries(oldestIndex.value)
