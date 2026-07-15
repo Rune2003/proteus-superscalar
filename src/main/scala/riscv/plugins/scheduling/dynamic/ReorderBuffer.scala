@@ -264,6 +264,14 @@ class ReorderBuffer(
     adjusted
   }
 
+  def isOlder(a: UInt, b: UInt): Bool = {
+    relativeIndexForAbsolute(a) < relativeIndexForAbsolute(b)
+  }
+
+  def isYounger(a: UInt, b: UInt): Bool = {
+    relativeIndexForAbsolute(a) > relativeIndexForAbsolute(b)
+  }
+
   def pushEntry(): (UInt, EntryMetadata) = {
     val issueStage = pipeline.issuePipeline.stages.last
 
@@ -455,12 +463,9 @@ class ReorderBuffer(
       val entryAddress = lsuService.addressOfBundle(entry.registerMap)
       val entryWordAddress = byte2WordAddress(entryAddress)
       val addressesMatch = entryWordAddress === wordAddress
-      val isOlder = relativeIndexForAbsolute(index) < relativeIndexForAbsolute(robIndex)
 
       when(
-        isValidAbsoluteIndex(nth)
-          && isOlder
-          && entryIsStore
+        isValidAbsoluteIndex(nth) && isOlder(index, robIndex)  && entryIsStore
       ) {
         when(entryAddressValid && addressesMatch) {
           foundMatch := True
