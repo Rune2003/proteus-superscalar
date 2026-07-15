@@ -124,8 +124,8 @@ class ReorderBuffer(
     ssbPredictorCounter.increment()
   }
 
-  /* data structures related to predictive store forwarding (PSF)
-   *
+  /*
+   * data structures related to predictive store forwarding (PSF)
    */
 
   val psfMispredictions = RegInit(UInt(config.xlen bits).getZero)
@@ -169,39 +169,58 @@ class ReorderBuffer(
     }
   }
 
-  /*
-   * Flush mechanism arbitration classes and structures
+  /** A builder pattern helper used to attach specific callbacks or actions to a flush request
+   * depending on the type of flush (soft or hard) granted by the arbiter.
+   *
+   * @param req The parent [[FlushPort]] associated with this builder.
    */
-
-
   class FlushActionBuilder(req: FlushPort) {
+    /** Registers a block of code to execute if a soft flush is granted. */
     def onSoftFlush(block: => Unit): FlushActionBuilder = {
       when(req.grantedSoftFlush) { block }
       this
     }
 
+    /** Registers a block of code to execute if a hard flush is granted. */
     def onHardFlush(block: => Unit): FlushActionBuilder = {
       when(req.grantedHardFlush) { block }
       this
     }
 
+    /** Registers a block of code to execute if either a soft or hard flush is granted. */
     def onAnyFlush(block: => Unit): FlushActionBuilder = {
       when(req.grantedAnyFlush) { block }
       this
     }
   }
 
+  /** Represents a port through which pipeline services can request a pipeline flush.
+   * Automatically registers itself into the ROB's internal `_flushRequests` list upon creation.
+   */
   class FlushPort(implicit config: Config) extends Bundle {
-    flushRequests += this
+    // Automatically register this port into the global arbitration pool so the correct logic can be added later.
+    _flushRequests += this
 
+    /** Indicates whether this flush request is active. */
     val valid            = Bool()
+    /** The ROB index of the last correct instruction (typically the instruction requesting the flush). */
     val lastCorrectId    = UInt(indexBits)
+    /** The target program counter (PC) where execution should resume after the flush. */
     val nextPc           = UInt(config.xlen bits)
 
+    /** Set if this request wins and is serviced via a soft flush. */
     val grantedSoftFlush = Bool()
+    /** Set if this request is serviced via a hard flush. */
     val grantedHardFlush = Bool()
+    /** Helper indicating if any flush type was granted to this request. */
     def grantedAnyFlush  = grantedSoftFlush || grantedHardFlush
 
+    /** Initializes the flush port with target metadata and defaults flags to false.
+     *
+     * @param lastCorrectId The ROB index of the instruction requesting the flush.
+     * @param nextPc The target PC to jump to after flushing.
+     * @return This initialized [[FlushPort]] instance.
+     */
     def init(lastCorrectId: UInt, nextPc: UInt): FlushPort = {
       this.lastCorrectId := lastCorrectId
       this.nextPc := nextPc
@@ -211,11 +230,20 @@ class ReorderBuffer(
       this
     }
 
+    /** Activates the flush request and returns an action builder to register callbacks.
+     *
+     * @return A [[FlushActionBuilder]] for handling grant callbacks.
+     */
     def request(): FlushActionBuilder = {
       this.valid := True
       new FlushActionBuilder(this)
     }
 
+    /** Convenience method to trigger a flush due to a Predictive Store Forwarding (PSF) misprediction.
+     * Automatically trains the PSF predictor and increments the misprediction counter when granted.
+     * TODO: Should be moved to a PSF specific module later.
+     * @param pc The PC of the mispredicted instruction.
+     */
     def requestPsf(pc: UInt): Unit = {
       request().onAnyFlush {
         addPsfPredictorEntry(pc)
@@ -223,6 +251,12 @@ class ReorderBuffer(
       }
     }
 
+    /** Convenience method to trigger a flush due to a Speculative Store Bypass (SSB) misprediction.
+     * Automatically trains the SSB predictor and increments the misprediction counter when granted.
+     * TODO: Should be moved to a SSB specific module later.
+     *
+     * @param pc The PC of the mispredicted instruction.
+     */
     def requestSsb(pc: UInt): Unit = {
       request().onAnyFlush {
         addSsbPredictorEntry(pc)
@@ -231,15 +265,28 @@ class ReorderBuffer(
     }
   }
 
-  private val flushRequests = ArrayBuffer[FlushPort]()
+  /** Collection of all active flush ports instantiated during code generation. */
+  private val _flushRequests = ArrayBuffer[FlushPort]()
 
-
+  /** Evaluates all pending flush requests, arbitrates to find the oldest requesting instruction,
+   * and executes the appropriate flush mechanism (Soft Flush vs. Hard Flush).
+   *
+   * A **Soft Flush** is preferred as it immediately invalidates only younger, speculative instructions
+   * in the ROB and redirects the fetch stage without waiting for the faulting instruction to retire.
+   *
+   * Due to hardware constraints, there can only be one soft flush at a time. If it is already taken,
+   * a **Hard Flush** acts as a fallback by marking the instruction bundle to jump upon retirement
+   * completely wiping the pipeline when it reaches the end of the ROB.
+   */
   def processFlushes(): Unit = {
     var winnerFound: Bool = False
     var winningIndex: UInt = U(0, indexBits)
     var winningPc: UInt = U(0, config.xlen bits)
 
-    for (req <- flushRequests) {
+    // Iterate through all registered flush ports to find the oldest request in this cycle.
+    // In an out-of-order execution engine, the oldest instruction always takes priority to ensure
+    // program order correctness.
+    for (req <- _flushRequests) {
       val older = isOlder(req.lastCorrectId, winningIndex)
       val takeThis = req.valid && (!winnerFound || older)
 
@@ -251,26 +298,29 @@ class ReorderBuffer(
     when(winnerFound) {
       val winningEntry = robEntries(winningIndex)
 
+      // Ensure the winning entry hasn't already been invalidated by an earlier flush
+      // and that a global hard reset isn't currently taking place.
       when(!winningEntry.invalidated && !hardResetThisCycle) {
-        val winnerMask = B(flushRequests.map(req => req.valid && req.lastCorrectId === winningIndex))
+
+        // Handle edge cases where multiple ports request a flush from the EXACT same instruction index.
+        // We create a bitmask of all valid requests matching the winning index and pick the first one.
+        val winnerMask = B(_flushRequests.map(req => req.valid && req.lastCorrectId === winningIndex))
         val singleWinnerOH = OHMasking.firstV2(winnerMask)
 
-        // 1. Isolate the retirement check adapted for single-retire ROB
+        // Check if the current soft reset is still valid or if it can be replaced.
         val currentTriggerRetiring = softResetTrigger.valid &&
           softResetTrigger.payload === oldestIndex.value &&
           willRetire
-
-        // 2. Define `currentTriggerValid` as an ACTIVE trigger, not just a retiring one
         val currentTriggerValid = softResetTrigger.valid && !currentTriggerRetiring
-
-        // 3. Routing booleans utilizing the corrected active state
         val isRedundant = currentTriggerValid && winningIndex === softResetTrigger.payload
+
+        // We can perform a soft flush if there is no active trigger, or if the new flush is older than the existing trigger.
         val canSoftFlush = !currentTriggerValid || isOlder(winningIndex, softResetTrigger.payload)
 
         when(isRedundant) {
-          // Do nothing
+          // Do nothing; the pipeline is already scheduled to flush from this instruction point.
         } elsewhen(canSoftFlush) {
-          // --- SOFT FLUSH ---
+          // --- SOFT FLUSH EXECUTION ---
           fenceDetected := False
           softResetThisCycle := True
           softResetTrigger.push(winningIndex)
@@ -280,12 +330,14 @@ class ReorderBuffer(
           pipeline.issuePipeline.service[JumpService].jump(winningPc)
           lastSpeculativeCFInstruction.setIdle()
 
-          for ((req, i) <- flushRequests.zipWithIndex) {
+          // Grant the soft flush signal to the winning port to trigger its `onSoftFlush` / `onAnyFlush` callbacks.
+          for ((req, i) <- _flushRequests.zipWithIndex) {
             when(singleWinnerOH(i)) {
               req.grantedSoftFlush := True
             }
           }
 
+          // Invalidate all ROB entries younger than the winning instruction.
           for (relative <- 0 until capacity) {
             val absolute = absoluteIndexForRelative(relative).resized
             val entry = robEntries(absolute)
@@ -293,6 +345,7 @@ class ReorderBuffer(
               when(relative > relativeIndexForAbsolute(winningIndex)) {
                 entry.invalidated := True
               } otherwise {
+                // For surviving older entries, update the latest speculative control-flow tracking.
                 pipeline.serviceOption[SpeculationService] foreach { spec =>
                   when(spec.isSpeculativeCF(entry.registerMap)) {
                     lastSpeculativeCFInstruction.push(absolute)
@@ -304,9 +357,12 @@ class ReorderBuffer(
           softFlushCounter := softFlushCounter + 1
         } otherwise {
           // --- HARD FLUSH FALLBACK ---
+          // If a soft flush cannot be applied, defer the flush until the winning instruction retires.
+          // This is done by asserting the jump flag on the instruction's register bundle.
           pipeline.service[JumpService].jumpOfBundle(winningEntry.registerMap) := True
 
-          for ((req, i) <- flushRequests.zipWithIndex) {
+          // Grant the hard flush signal to the winning port to trigger its `onHardFlush` / `onAnyFlush` callbacks.
+          for ((req, i) <- _flushRequests.zipWithIndex) {
             when(singleWinnerOH(i)) {
               req.grantedHardFlush := True
             }
