@@ -782,8 +782,6 @@ class ReorderBuffer(
   }
 
   def build(): Unit = {
-    processFlushes()
-
     isFullNext := isFull
     fenceDetectedNext := fenceDetected
     val oldestEntry = robEntries(oldestIndex.value)

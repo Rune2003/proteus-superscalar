@@ -81,6 +81,8 @@ class Scheduler() extends Plugin[DynamicPipeline] with IssueService {
       val dispatchBus = new DispatchBus(reservationStations, rob, dispatcher, registerBundle)
       dispatchBus.build()
 
+      rob.processFlushes()
+
       dispatcher.rdbStream >> robDataBus.inputs(0)
 
       for ((rs, index) <- reservationStations.zipWithIndex) {
