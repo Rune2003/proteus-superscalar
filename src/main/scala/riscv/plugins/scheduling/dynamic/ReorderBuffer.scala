@@ -312,7 +312,7 @@ class ReorderBuffer(
           softResetTrigger.payload === oldestIndex.value &&
           willRetire
         val currentTriggerValid = softResetTrigger.valid && !currentTriggerRetiring
-        val isRedundant = currentTriggerValid && winningIndex === softResetTrigger.payload
+        val isRedundant = currentTriggerValid && winningIndex === softResetTrigger.payload || pipeline.service[JumpService].jumpOfBundle(winningEntry.registerMap)
 
         // We can perform a soft flush if there is no active trigger, or if the new flush is older than the existing trigger.
         val canSoftFlush = !currentTriggerValid || isOlder(winningIndex, softResetTrigger.payload)
