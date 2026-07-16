@@ -204,6 +204,9 @@ class ReservationStation(
 
 
   def build(): Unit = {
+
+    val lsu = pipeline.service[LsuService]
+
     meta.build()
 
     cdbWaitingNext := cdbWaiting
@@ -251,6 +254,8 @@ class ReservationStation(
         }
         cdbStream.payload.writeValue := rob.previousStoreBuffer
         cdbStream.payload.robIndex := robEntryIndex
+        lsu.psfState(cdbStream.metadata) := PsfState.PREDICTION
+
         cdbStream.valid := True
         when(cdbStream.ready) {
           broadcastedPsfPrediction := True
@@ -265,13 +270,10 @@ class ReservationStation(
       cdbStream.payload.robIndex := robEntryIndex
       dispatchStream.payload.robIndex := robEntryIndex
 
-      val lsu = pipeline.service[LsuService]
-
       val isLoad = lsu.operationOutput(exeStage) === LsuOperationType.LOAD
-
       val broadcastedIncorrectPsfPrediction = Bool()
 
-      for (register <- retirementRegisters.keys.filter(e => e != lsu.psfMisspeculationRegister)) {
+      for (register <- retirementRegisters.keys.filter(e => e != lsu.psfStateRegister)) {
         dispatchStream.payload.registerMap.element(register) := exeStage.output(register)
       }
 
@@ -289,8 +291,14 @@ class ReservationStation(
         broadcastedIncorrectPsfPrediction := isLoad && lsu.address(
           exeStage
         ) =/= psfPredictedAddress && broadcastedPsfPrediction && !noPsfPrediction
-        lsu.psfMisspeculation(cdbStream.metadata) := broadcastedIncorrectPsfPrediction
-        lsu.psfMisspeculation(dispatchStream.registerMap) := broadcastedIncorrectPsfPrediction
+
+        lsu.psfState(cdbStream.metadata) := PsfState.NONE
+        lsu.psfState(dispatchStream.registerMap) := PsfState.NONE
+
+        when(broadcastedIncorrectPsfPrediction) {
+          lsu.psfState(cdbStream.metadata) := PsfState.WARNING
+          lsu.psfState(dispatchStream.registerMap) := PsfState.MISS
+        }
       }
 
       pipeline.serviceOption[SpeculationService] match {

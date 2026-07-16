@@ -541,51 +541,55 @@ class ReorderBuffer(
     // TODO: the PSF update logic is probably way too complicated...
     val lsu = pipeline.service[LsuService]
 
-    val pc = robEntries(cdbMessage.robIndex).registerMap
+    val entry = robEntries(cdbMessage.robIndex)
+    val pc = entry.registerMap
       .elementAs[UInt](pipeline.data.PC.asInstanceOf[PipelineData[Data]])
-    val nextPc = robEntries(cdbMessage.robIndex).registerMap
+    val nextPc = entry.registerMap
       .elementAs[UInt](pipeline.data.NEXT_PC.asInstanceOf[PipelineData[Data]])
     val flushPort = (new FlushPort).init(cdbMessage.robIndex, nextPc)
 
     when(cdbMessage.valid) {
       if (config.addressBasedPsf) {
-        when(lsu.psfMisspeculation(cdbMessage.metadata)) {
-          robEntries(cdbMessage.robIndex).cdbUpdated := robEntries(
-            cdbMessage.robIndex
-          ).rdbUpdated || (currentRdbUpdate.valid && currentRdbUpdate.payload === cdbMessage.robIndex)
-          currentCdbUpdate.push(cdbMessage.robIndex)
-          flushPort.requestPsf(pc)
-        } otherwise {
-          robEntries(cdbMessage.robIndex).cdbUpdated := True
-          robEntries(cdbMessage.robIndex).registerMap
-            .element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]]) := cdbMessage.writeValue
+        switch(lsu.psfState(cdbMessage.metadata)) {
+          is(PsfState.NONE) {
+            entry.cdbUpdated := True
+            entry.registerMap.element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]]) := cdbMessage.writeValue
+          }
+          is(PsfState.WARNING) {
+            flushPort.requestPsf(pc)
+          }
+          is(PsfState.MISS) {
+            flushPort.requestPsf(pc)
+            entry.cdbUpdated := True
+            entry.registerMap.element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]]) := cdbMessage.writeValue
+          }
+          is(PsfState.PREDICTION) {
+            psfPredictions := psfPredictions + 1
+          }
         }
       } else {
-        robEntries(cdbMessage.robIndex).cdbUpdated := True
-        robEntries(cdbMessage.robIndex).registerMap
-          .element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]]) := cdbMessage.writeValue
+        entry.cdbUpdated := True
+        entry.registerMap.element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]]) := cdbMessage.writeValue
       }
 
-      lsu.psfAddress(robEntries(cdbMessage.robIndex).registerMap) := lsu.psfAddress(
-        cdbMessage.metadata
-      )
+      // TODO: Check this
+      when(!entry.cdbUpdated) {
 
-      pipeline.serviceOption[SpeculationService] foreach { spec =>
-        // mark PSF speculation
-        spec.isSpeculativeMD(robEntries(cdbMessage.robIndex).registerMap) := spec.isSpeculativeMD(
-          cdbMessage.metadata
-        )
-        spec.isSpeculativeCF(robEntries(cdbMessage.robIndex).registerMap) := spec.isSpeculativeCF(
-          cdbMessage.metadata
-        )
+        if (config.addressBasedPsf) {
+          lsu.psfAddress(entry.registerMap) := lsu.psfAddress(cdbMessage.metadata)
+        }
 
-        // if this instruction's CF change was correctly predicted, disregard it as the most recent speculative instruction
-        when(
-          lastSpeculativeCFInstruction.valid &&
-            lastSpeculativeCFInstruction.payload === cdbMessage.robIndex &&
-            !spec.isSpeculativeCF(cdbMessage.metadata)
-        ) {
-          lastSpeculativeCFInstruction := spec.speculationDependency(cdbMessage.metadata).resized
+        pipeline.serviceOption[SpeculationService] foreach { spec =>
+          spec.isSpeculativeMD(entry.registerMap) := spec.isSpeculativeMD(cdbMessage.metadata)
+          spec.isSpeculativeCF(entry.registerMap) := spec.isSpeculativeCF(cdbMessage.metadata)
+
+          when(
+            lastSpeculativeCFInstruction.valid &&
+              lastSpeculativeCFInstruction.payload === cdbMessage.robIndex &&
+              !spec.isSpeculativeCF(cdbMessage.metadata)
+          ) {
+            lastSpeculativeCFInstruction := spec.speculationDependency(cdbMessage.metadata).resized
+          }
         }
       }
     }
@@ -691,16 +695,17 @@ class ReorderBuffer(
     val flushPort = (new FlushPort).init(rdbMessage.robIndex, nextPc)
 
     when(rdbMessage.valid) {
-      currentRdbUpdate.push(rdbMessage.robIndex)
       entry.registerMap := rdbMessage.registerMap
       entry.willCdbUpdate := rdbMessage.willCdbUpdate
 
+      // Exception 1: Branch Misprediction
       when(nextPc =/= btb.predictedPc(rdbMessage.registerMap)) {
         flushPort.request().onSoftFlush {
           btb.preventFlush(entry.registerMap)
         }
       }
 
+      // Exception 2: CSR Serialization
       when(pipeline.service[CsrService].isCsrInstruction(rdbMessage.registerMap)) {
         flushPort.request().onSoftFlush {
           jmp.jumpOfBundle(entry.registerMap) := True
@@ -708,6 +713,8 @@ class ReorderBuffer(
       }
 
       if (config.stlSpec) {
+
+        // Exception 3: SSB
         when(
           lsu.operationOfBundle(rdbMessage.registerMap) === LsuOperationType.STORE
         ) {
@@ -731,53 +738,27 @@ class ReorderBuffer(
           }
         }
 
+        // Exception 4: Predictive Store Forwarding (PSF)
         if (config.addressBasedPsf) {
-          when(lsu.psfMisspeculation(rdbMessage.registerMap)) {
+          when(lsu.psfState(rdbMessage.registerMap) === PsfState.MISS) {
             flushPort.requestPsf(pc)
           }
-          when(
-            lsu.operationOfBundle(rdbMessage.registerMap) === LsuOperationType.LOAD
-          ) {
-            totalLoads := totalLoads + 1
-            when(
-              (currentCdbUpdate.valid && currentCdbUpdate.payload === rdbMessage.robIndex) || jmp
-                .jumpOfBundle(robEntries(rdbMessage.robIndex).registerMap)
-            ) {
-              jmp.jumpOfBundle(robEntries(rdbMessage.robIndex).registerMap) := True
-            } otherwise {
-              psfPredictions := psfPredictions + 1
-            }
-          }
-        }
 
-        if (!config.addressBasedPsf) {
-          // detect wrongly forwarded value-based PSF
-          when(
-            lsu.operationOfBundle(rdbMessage.registerMap) === LsuOperationType.LOAD && robEntries(
-              rdbMessage.robIndex
-            ).cdbUpdated
-          ) {
-            val psfMismatch: Bool = if (config.addressBasedPsf) {
-              lsu.psfAddress(robEntries(rdbMessage.robIndex).registerMap) =/= lsu.addressOfBundle(
-                rdbMessage.registerMap
-              )
-            } else {
-              rdbMessage.registerMap.element(
-                pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]]
-              ) =/= robEntries(rdbMessage.robIndex).registerMap
-                .element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]])
-            }
+        } else {
+          // Value-based PSF Fallback
+          when(lsu.operationOfBundle(rdbMessage.registerMap) === LsuOperationType.LOAD && entry.cdbUpdated) {
+
+            val psfMismatch = rdbMessage.registerMap.element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]]) =/=
+              entry.registerMap.element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]])
 
             when(psfMismatch) {
               flushPort.requestPsf(pc)
-            } otherwise {
-              psfPredictions := psfPredictions + 1
             }
           }
         }
       }
 
-      robEntries(rdbMessage.robIndex).rdbUpdated := True
+      entry.rdbUpdated := True
     }
   }
 
