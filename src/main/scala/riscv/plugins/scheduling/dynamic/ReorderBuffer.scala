@@ -548,33 +548,39 @@ class ReorderBuffer(
       .elementAs[UInt](pipeline.data.NEXT_PC.asInstanceOf[PipelineData[Data]])
     val flushPort = (new FlushPort).init(cdbMessage.robIndex, nextPc)
 
+    def processValidEntry(): Unit = {
+      entry.cdbUpdated := True
+      entry.registerMap.element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]]) := cdbMessage.writeValue
+    }
+
     when(cdbMessage.valid) {
       if (config.addressBasedPsf) {
         switch(lsu.psfState(cdbMessage.metadata)) {
           is(PsfState.NONE) {
-            entry.cdbUpdated := True
-            entry.registerMap.element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]]) := cdbMessage.writeValue
-          }
-          is(PsfState.WARNING) {
-            flushPort.requestPsf(pc)
-          }
-          is(PsfState.MISS) {
-            flushPort.requestPsf(pc)
-            entry.cdbUpdated := True
-            entry.registerMap.element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]]) := cdbMessage.writeValue
+            processValidEntry()
           }
           is(PsfState.PREDICTION) {
             psfPredictions := psfPredictions + 1
           }
+          is(PsfState.WARNING) {
+            // Request a flush
+            flushPort.requestPsf(pc)
+          }
+          is(PsfState.MISS) {
+            // Request a flush (this may be redundant but it is technically possible that the WARNING message has not
+            // arrived yet.). The flush is still necessary because the reservation stations received the incorrect value
+            // from the prediction.
+            flushPort.requestPsf(pc)
+
+            // This message does contain the correct values, so store the values
+            processValidEntry()
+          }
         }
       } else {
-        entry.cdbUpdated := True
-        entry.registerMap.element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]]) := cdbMessage.writeValue
+        processValidEntry()
       }
 
-      // TODO: Check this
       when(!entry.cdbUpdated) {
-
         if (config.addressBasedPsf) {
           lsu.psfAddress(entry.registerMap) := lsu.psfAddress(cdbMessage.metadata)
         }
@@ -695,6 +701,8 @@ class ReorderBuffer(
     val flushPort = (new FlushPort).init(rdbMessage.robIndex, nextPc)
 
     when(rdbMessage.valid) {
+
+      // Copy all pipeline data
       entry.registerMap := rdbMessage.registerMap
       entry.willCdbUpdate := rdbMessage.willCdbUpdate
 
@@ -713,7 +721,6 @@ class ReorderBuffer(
       }
 
       if (config.stlSpec) {
-
         // Exception 3: SSB
         when(
           lsu.operationOfBundle(rdbMessage.registerMap) === LsuOperationType.STORE
@@ -731,9 +738,7 @@ class ReorderBuffer(
             }
           }
 
-          val ssbReset = hasSpeculatingLoad(rdbMessage.robIndex, storeValue, storeAddress)
-
-          when(ssbReset) {
+          when(hasSpeculatingLoad(rdbMessage.robIndex, storeValue, storeAddress)) {
             flushPort.requestSsb(pc)
           }
         }
@@ -743,11 +748,9 @@ class ReorderBuffer(
           when(lsu.psfState(rdbMessage.registerMap) === PsfState.MISS) {
             flushPort.requestPsf(pc)
           }
-
         } else {
           // Value-based PSF Fallback
           when(lsu.operationOfBundle(rdbMessage.registerMap) === LsuOperationType.LOAD && entry.cdbUpdated) {
-
             val psfMismatch = rdbMessage.registerMap.element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]]) =/=
               entry.registerMap.element(pipeline.data.RD_DATA.asInstanceOf[PipelineData[Data]])
 
